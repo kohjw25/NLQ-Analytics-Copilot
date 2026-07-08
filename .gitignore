@@ -1,0 +1,10 @@
+ab_data.csv
+.ipynb_checkpoints/
+.DS_Store
+__pycache__/
+*.pyc
+chart.html
+.streamlit/secrets.toml
+.venv/
+venv/
+env/

@@ -1,0 +1,12 @@
+# Streamlit configuration used both locally and when deployed.
+[server]
+headless = true
+# Streamlit Community Cloud ignores `port` (it assigns one); it is respected by
+# container/VM deploys. 8501 is Streamlit's default.
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"

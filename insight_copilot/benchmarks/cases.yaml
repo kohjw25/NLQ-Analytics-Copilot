@@ -1,0 +1,87 @@
+# Benchmark cases for the Insight Copilot evaluation harness (PRD 7.9).
+#
+# Ground truth is the `reference_sql` (correct logic). `candidate_sql` is the query
+# under test — swap in an LLM-generated query to score it. Some cases below ship a
+# deliberately wrong candidate to demonstrate failure classification.
+cases:
+  - id: q2_top_region
+    dataset: sample_ecommerce.csv
+    question: "Which region had the highest revenue in Q2?"
+    reference_sql: >
+      SELECT Region, SUM(Revenue) AS total_revenue
+      FROM data
+      WHERE CAST(strftime(CAST("Order Date" AS DATE), '%m') AS INTEGER) BETWEEN 4 AND 6
+      GROUP BY Region
+      ORDER BY total_revenue DESC
+      LIMIT 1
+    candidate_sql: >
+      SELECT Region, SUM(Revenue) AS total_revenue
+      FROM data
+      WHERE CAST(strftime(CAST("Order Date" AS DATE), '%m') AS INTEGER) BETWEEN 4 AND 6
+      GROUP BY Region
+      ORDER BY total_revenue DESC
+      LIMIT 1
+    expected_columns: [Region, Revenue]
+    expected_chart: bar
+    candidate_chart: bar
+
+  - id: revenue_trend_by_month
+    dataset: sample_ecommerce.csv
+    question: "Show revenue trend by month"
+    reference_sql: >
+      SELECT strftime(CAST("Order Date" AS DATE), '%Y-%m') AS month,
+             SUM(Revenue) AS total_revenue
+      FROM data
+      GROUP BY month
+      ORDER BY month
+    candidate_sql: >
+      SELECT strftime(CAST("Order Date" AS DATE), '%Y-%m') AS month,
+             SUM(Revenue) AS total_revenue
+      FROM data
+      GROUP BY month
+      ORDER BY month
+    expected_columns: [Order Date, Revenue]
+    expected_chart: line
+    candidate_chart: line
+
+  - id: top3_categories
+    dataset: sample_ecommerce.csv
+    question: "What are the top 3 product categories by revenue?"
+    reference_sql: >
+      SELECT "Product Category" AS category, SUM(Revenue) AS total_revenue
+      FROM data
+      GROUP BY category
+      ORDER BY total_revenue DESC
+      LIMIT 3
+    # Deliberately wrong: sorts ascending -> should be flagged wrong_sort_order.
+    candidate_sql: >
+      SELECT "Product Category" AS category, SUM(Revenue) AS total_revenue
+      FROM data
+      GROUP BY category
+      ORDER BY total_revenue ASC
+      LIMIT 3
+    expected_columns: [Product Category, Revenue]
+    expected_chart: bar
+    candidate_chart: bar
+
+  - id: revenue_share_by_segment
+    dataset: sample_ecommerce.csv
+    question: "What is the share of total revenue by customer segment?"
+    reference_sql: >
+      SELECT "Customer Segment" AS segment,
+             SUM(Revenue) AS revenue,
+             100.0 * SUM(Revenue) / (SELECT SUM(Revenue) FROM data) AS pct_of_total
+      FROM data
+      GROUP BY segment
+      ORDER BY revenue DESC
+    candidate_sql: >
+      SELECT "Customer Segment" AS segment,
+             SUM(Revenue) AS revenue,
+             100.0 * SUM(Revenue) / (SELECT SUM(Revenue) FROM data) AS pct_of_total
+      FROM data
+      GROUP BY segment
+      ORDER BY revenue DESC
+    expected_columns: [Customer Segment, Revenue]
+    # Deliberately wrong chart: a scatter is inappropriate for share -> flagged.
+    expected_chart: donut
+    candidate_chart: scatter

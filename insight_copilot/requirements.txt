@@ -1,0 +1,12 @@
+pandas>=1.5
+duckdb>=0.9
+plotly>=5.0
+openpyxl>=3.0
+pyyaml>=6.0
+streamlit>=1.30
+# Optional LLM backends for the NL->SQL layer. The app falls back to a
+# rule-based generator when neither key is set.
+#   OpenRouter (cheap/free models, OpenAI-compatible): set OPENROUTER_API_KEY
+openai>=1.30
+#   Anthropic (Claude): set ANTHROPIC_API_KEY
+anthropic>=0.40

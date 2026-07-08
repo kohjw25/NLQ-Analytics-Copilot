@@ -1,0 +1,10 @@
+# Root requirements — deployment hosts (e.g. Streamlit Community Cloud) install
+# from here. Kept in sync with insight_copilot/requirements.txt.
+pandas>=1.5
+duckdb>=0.9
+plotly>=5.0
+openpyxl>=3.0
+pyyaml>=6.0
+streamlit>=1.30
+openai>=1.30
+anthropic>=0.40
