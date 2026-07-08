@@ -147,12 +147,12 @@ def _screen_profile() -> None:
     c3.metric("Date fields", len(p["date_fields"]))
 
     st.markdown("**Preview**")
-    st.dataframe(pd.DataFrame(p["preview"]), use_container_width=True)
+    st.dataframe(pd.DataFrame(p["preview"]), width="stretch")
 
     st.markdown("**Detected fields**")
     st.dataframe(
         pd.DataFrame(p["columns"])[["name", "dtype", "role", "missing_pct"]],
-        use_container_width=True,
+        width="stretch",
     )
 
     if p["quality_warnings"]:
@@ -210,12 +210,12 @@ def _screen_ask() -> None:
     spec = recommend_chart(plan.intent, df, date_cols=p["date_fields"])
     with col_chart:
         try:
-            st.plotly_chart(build_figure(spec, df), use_container_width=True)
+            st.plotly_chart(build_figure(spec, df), width="stretch")
         except Exception:
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
         st.caption(f"Chart: {spec['chart_type']} ({spec['reason']})")
     with col_table:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
     # Trust panel (PRD 7.8).
     faith = check_insight_faithfulness(insight, df)
@@ -284,7 +284,7 @@ def _screen_eval() -> None:
     dims = report["dimension_averages"]
     st.dataframe(
         pd.DataFrame([{"dimension": k, "score": v} for k, v in dims.items()]),
-        use_container_width=True,
+        width="stretch",
     )
 
     if report["failure_type_counts"]:
@@ -302,7 +302,7 @@ def _screen_eval() -> None:
         }
         for c in report["cases"]
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch")
 
 
 # --- main ---------------------------------------------------------------------
@@ -320,4 +320,8 @@ def main() -> None:
         _screen_eval()
 
 
-main()
+try:
+    main()
+except Exception as exc:  # noqa: BLE001 -- surface errors instead of a blank screen
+    st.error("The app hit an error while rendering. Details below:")
+    st.exception(exc)
