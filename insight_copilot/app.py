@@ -23,12 +23,23 @@ from insight_copilot.charts import recommend_chart, build_figure
 from insight_copilot.trust import build_trust_panel, check_insight_faithfulness
 from insight_copilot.nl2sql import (
     generate_query,
+    apply_aggregation,
     resolve_provider,
     model_for,
     SUGGESTED_FREE_MODELS,
     SUGGESTED_ANTHROPIC_MODELS,
 )
-from insight_copilot.evaluate import run_suite
+
+# Aggregation choices for the Ask tab. Maps the UI label to the SQL function
+# (None = leave the query's default: sum, or average for rate columns).
+_AGG_OPTIONS = {
+    "Auto (sum / avg for rates)": None,
+    "Sum": "sum",
+    "Average": "avg",
+    "Minimum": "min",
+    "Maximum": "max",
+}
+from insight_copilot.evaluate import run_suite, self_evaluate
 
 st.set_page_config(page_title="Insight Copilot", page_icon="📊", layout="wide")
 
@@ -192,10 +203,21 @@ def _screen_ask() -> None:
         st.warning(f"**Clarification needed:** {plan.clarification}")
         return
 
-    result = run_sql(path, plan.sql)
+    # Aggregation control — instantly rewrites SUM/AVG/MIN/MAX in the generated
+    # query without re-calling the model.
+    agg_label = st.selectbox(
+        "Aggregate metrics using",
+        list(_AGG_OPTIONS),
+        key="ask_agg",
+        help="Applies to the numeric metric columns. 'Auto' uses sum (average for "
+        "rate columns such as a 0/1 flag).",
+    )
+    sql = apply_aggregation(plan.sql, _AGG_OPTIONS[agg_label])
+
+    result = run_sql(path, sql)
     if not result.ok:
         st.error(f"Query failed: {result.error}")
-        st.code(plan.sql, language="sql")
+        st.code(sql, language="sql")
         return
 
     df = pd.DataFrame(result.rows)
@@ -220,16 +242,17 @@ def _screen_ask() -> None:
     # Trust panel (PRD 7.8).
     faith = check_insight_faithfulness(insight, df)
     panel = build_trust_panel(
-        sql=plan.sql,
+        sql=sql,
         result_df=df,
         columns_used=plan.columns_used,
         assumptions=plan.assumptions,
         confidence=plan.confidence,
-        aggregation=None,
+        aggregation=agg_label,
         warnings=[] if faith["faithful"] else ["Insight cites numbers not in the result."],
     )
     with st.expander("How this was calculated"):
         st.markdown(f"**Confidence:** {panel['confidence']}  ·  **Engine:** {plan.backend}")
+        st.write("**Aggregation:**", panel["aggregation"])
         st.code(panel["query"], language="sql")
         st.write("**Columns used:**", ", ".join(panel["columns_used"]) or "—")
         st.write("**Assumptions:**")
@@ -264,45 +287,92 @@ def _build_insight(question: str, df: pd.DataFrame, intent: str) -> str:
 # --- Screen 3: Evaluation Dashboard ------------------------------------------
 
 def _screen_eval() -> None:
-    st.subheader("Evaluation dashboard")
-    cases = st.text_input("Benchmark cases file", value=DEFAULT_CASES)
-    if st.button("Run evaluation", type="primary"):
-        with st.spinner("Running benchmark suite..."):
-            st.session_state["eval_report"] = run_suite(cases)
-
-    report = st.session_state.get("eval_report")
-    if not report:
-        st.info("Run the benchmark suite to see query accuracy and failure types.")
+    st.subheader("Evaluation")
+    if "profile" not in st.session_state:
+        st.info("Load a dataset from the sidebar first — the evaluation runs against it.")
         return
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pass rate", f"{report['pass_rate'] * 100:.0f}%")
-    c2.metric("Cases", report["n_cases"])
-    c3.metric("Passed", report["passed"])
-
-    st.markdown("**Per-dimension averages**")
-    dims = report["dimension_averages"]
-    st.dataframe(
-        pd.DataFrame([{"dimension": k, "score": v} for k, v in dims.items()]),
-        width="stretch",
+    p = st.session_state["profile"]
+    path = st.session_state["dataset_path"]
+    st.caption(f"Evaluating the copilot on: **{os.path.basename(path)}**")
+    st.write(
+        "Each question below is turned into a query and run against *your* dataset. "
+        "This measures reliability — do the generated queries use real columns, run, "
+        "and return rows? (Exact-answer scoring needs known correct answers, which "
+        "only exist for the built-in benchmark; see the expander below.)"
     )
 
-    if report["failure_type_counts"]:
-        st.markdown("**Failure types**")
-        st.bar_chart(pd.Series(report["failure_type_counts"]))
+    default_qs = "\n".join(p.get("suggested_questions", []))
+    qs_text = st.text_area(
+        "Questions to evaluate (one per line)", value=default_qs, height=170,
+        help="Prefilled from your dataset's suggested questions — edit freely.",
+    )
+    questions = [q.strip() for q in qs_text.splitlines() if q.strip()]
+    if resolve_provider() != "heuristic":
+        st.caption("⚠️ An LLM backend is active, so each question calls the model — "
+                   "keep the list short (free models are slow).")
 
-    st.markdown("**Cases**")
-    rows = [
-        {
-            "id": c["id"],
-            "question": c["question"],
-            "overall": c["overall"],
-            "passed": c["passed"],
-            "failures": "; ".join(c["failures"]) or "—",
-        }
-        for c in report["cases"]
-    ]
-    st.dataframe(pd.DataFrame(rows), width="stretch")
+    if st.button("Run evaluation", type="primary") and questions:
+        with st.spinner(f"Evaluating {len(questions)} question(s) on your dataset..."):
+            st.session_state["eval_report"] = self_evaluate(
+                path, p, questions, model=st.session_state.get("model")
+            )
+
+    report = st.session_state.get("eval_report")
+    if report and report.get("dataset") == path:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Questions", report["n_questions"])
+        c2.metric("Answered", f"{report['answered_pct']}%")
+        c3.metric("Ran OK", f"{report['executed_pct']}%")
+        c4.metric("Clarifications", report["clarify"])
+
+        if report["failure_type_counts"]:
+            st.markdown("**Issues by type**")
+            st.bar_chart(pd.Series(report["failure_type_counts"]))
+
+        st.markdown("**Per-question results**")
+        rows = [
+            {
+                "question": r["question"],
+                "status": r["status"],
+                "intent": r.get("intent", ""),
+                "rows": r.get("n_rows", 0),
+                "detail": (r.get("detail") or "")[:90],
+            }
+            for r in report["results"]
+        ]
+        st.dataframe(pd.DataFrame(rows), width="stretch")
+    else:
+        st.info("Enter questions and click **Run evaluation**.")
+
+    with st.expander("Advanced: run the built-in benchmark suite (sample dataset, scored vs. known answers)"):
+        st.caption(
+            "This is the fixed accuracy benchmark with hand-written correct answers "
+            "for the sample e-commerce data — it does not use your uploaded dataset."
+        )
+        if st.button("Run benchmark suite"):
+            with st.spinner("Running benchmark suite..."):
+                st.session_state["bench_report"] = run_suite(DEFAULT_CASES)
+        bench = st.session_state.get("bench_report")
+        if bench:
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Pass rate", f"{bench['pass_rate'] * 100:.0f}%")
+            b2.metric("Cases", bench["n_cases"])
+            b3.metric("Passed", bench["passed"])
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": c["id"],
+                            "question": c["question"],
+                            "overall": c["overall"],
+                            "passed": c["passed"],
+                            "failures": "; ".join(c["failures"]) or "—",
+                        }
+                        for c in bench["cases"]
+                    ]
+                ),
+                width="stretch",
+            )
 
 
 # --- main ---------------------------------------------------------------------
@@ -320,8 +390,21 @@ def main() -> None:
         _screen_eval()
 
 
-try:
-    main()
-except Exception as exc:  # noqa: BLE001 -- surface errors instead of a blank screen
-    st.error("The app hit an error while rendering. Details below:")
-    st.exception(exc)
+def run() -> None:
+    """Render the app, surfacing errors instead of a blank screen.
+
+    Must be CALLED on every Streamlit run. Do not rely on import side effects:
+    the deployment entrypoint (streamlit_app.py) imports this module once, so a
+    bottom-of-module main() call would only render on first load and blank on
+    every rerun.
+    """
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 -- surface errors instead of a blank screen
+        st.error("The app hit an error while rendering. Details below:")
+        st.exception(exc)
+
+
+if __name__ == "__main__":
+    # Runs when launched directly: `streamlit run insight_copilot/app.py`.
+    run()

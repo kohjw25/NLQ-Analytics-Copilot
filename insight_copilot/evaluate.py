@@ -36,6 +36,72 @@ DIMENSIONS = [
 ]
 
 
+def self_evaluate(
+    dataset_path: str,
+    profile: Dict[str, Any],
+    questions: List[str],
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Evaluate the copilot on a user's own dataset (no ground-truth answers).
+
+    For each question it generates a query and runs it against ``dataset_path``,
+    then reports how many produced a valid, non-empty answer. Because there are no
+    expected answers for an arbitrary upload, this measures reliability (does the
+    generated query use real columns, run, and return rows?) rather than exact
+    correctness. Column validity is enforced implicitly: DuckDB errors on unknown
+    columns, so an execution error means the query referenced something invalid.
+    """
+    from .nl2sql import generate_query
+    from .engine import run_sql
+
+    results: List[Dict[str, Any]] = []
+    for q in questions:
+        row: Dict[str, Any] = {"question": q}
+        try:
+            plan = generate_query(q, profile, model=model)
+            row["intent"] = plan.intent
+            row["backend"] = plan.backend
+            if plan.clarification and not plan.sql:
+                row.update(status="clarify", ok=False, n_rows=0,
+                           detail=plan.clarification, sql=None)
+            else:
+                res = run_sql(dataset_path, plan.sql)
+                row["sql"] = plan.sql
+                row["ok"] = res.ok
+                row["n_rows"] = res.n_rows
+                if not res.ok:
+                    row.update(status="error", detail=res.error)
+                elif res.n_rows == 0:
+                    row.update(status="empty", detail="Query ran but returned no rows.")
+                else:
+                    row.update(status="ok", detail="")
+        except Exception as exc:  # noqa: BLE001 -- one bad question shouldn't stop the run
+            row.update(status="error", ok=False, n_rows=0, sql=row.get("sql"),
+                       detail=f"{type(exc).__name__}: {exc}")
+        results.append(row)
+
+    n = len(results)
+    pct = lambda c: round(100 * c / n, 1) if n else 0.0  # noqa: E731
+    counts = {"ok": 0, "empty": 0, "error": 0, "clarify": 0}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    failure_type_counts = {k: v for k, v in counts.items() if k != "ok" and v}
+
+    return {
+        "dataset": dataset_path,
+        "n_questions": n,
+        "answered": counts["ok"],
+        "answered_pct": pct(counts["ok"]),
+        "executed_ok": counts["ok"] + counts["empty"],
+        "executed_pct": pct(counts["ok"] + counts["empty"]),
+        "empty": counts["empty"],
+        "errored": counts["error"],
+        "clarify": counts["clarify"],
+        "failure_type_counts": failure_type_counts,
+        "results": results,
+    }
+
+
 def load_cases(cases_path: str) -> List[Dict[str, Any]]:
     import yaml
 

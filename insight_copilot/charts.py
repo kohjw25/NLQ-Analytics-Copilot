@@ -93,26 +93,47 @@ def _has_temporal(df: pd.DataFrame) -> bool:
     return False
 
 
+def _series_is_temporal(series: pd.Series, name: str, date_cols: List[str]) -> bool:
+    if name in date_cols:
+        return True
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    if pd.api.types.is_object_dtype(series):
+        sample = series.dropna().astype(str).head(10)
+        if len(sample):
+            parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+            return parsed.notna().mean() >= 0.8
+    return False
+
+
 def _assign_axes(df: pd.DataFrame, chart: str, date_cols: List[str]):
+    """Return (x, y, color). A second categorical column becomes the colour/series
+    dimension so results grouped by two dimensions (e.g. month x category) render
+    as multiple lines / grouped bars instead of collapsing into one series."""
     cols = list(df.columns)
     numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
     non_numeric = [c for c in cols if c not in numeric]
+    temporal = [c for c in non_numeric if _series_is_temporal(df[c], c, date_cols)]
+
     if chart == "scorecard":
         return (numeric[0] if numeric else (cols[0] if cols else None)), None, None
     if chart == "scatter":
-        x = numeric[0] if numeric else None
-        y = numeric[1] if len(numeric) > 1 else None
-        return x, y, None
-    if chart == "line":
-        x = next((c for c in cols if c in date_cols), None) or (
-            non_numeric[0] if non_numeric else (cols[0] if cols else None)
-        )
-        y = numeric[0] if numeric else None
-        return x, y, None
-    # bar / donut / table
-    x = non_numeric[0] if non_numeric else (cols[0] if cols else None)
+        return (numeric[0] if numeric else None), (numeric[1] if len(numeric) > 1 else None), None
+
     y = numeric[0] if numeric else None
-    return x, y, None
+    if chart == "line":
+        x = (temporal[0] if temporal else (non_numeric[0] if non_numeric else (cols[0] if cols else None)))
+    else:  # bar / donut / table
+        x = non_numeric[0] if non_numeric else (cols[0] if cols else None)
+
+    # The first remaining categorical (not the x axis) drives the series/colour.
+    # Donuts encode the category as slices already, so they take no colour dim.
+    color = None
+    if chart in {"line", "bar"}:
+        remaining = [c for c in non_numeric if c != x]
+        if remaining:
+            color = remaining[0]
+    return x, y, color
 
 
 def _default_title(chart: str, x, y) -> str:
@@ -137,7 +158,8 @@ def build_figure(spec: Dict[str, Any], df: pd.DataFrame):
     if chart == "line":
         return px.line(df, x=x, y=y, color=color, title=title, markers=True)
     if chart == "bar":
-        return px.bar(df, x=x, y=y, color=color, title=title)
+        # Grouped bars when a colour/series dimension is present.
+        return px.bar(df, x=x, y=y, color=color, barmode="group", title=title)
     if chart == "scatter":
         return px.scatter(df, x=x, y=y, color=color, title=title)
     if chart == "donut":

@@ -135,15 +135,37 @@ _SYSTEM_PROMPT = (
     "table named `data`.\n"
     "Rules:\n"
     "- Use ONLY the columns listed in the schema; never invent columns or metrics.\n"
+    "- Map business words to the closest schema column by meaning (e.g. "
+    "'sales'/'income' -> a revenue-like metric; 'product'/'category' -> a category "
+    "dimension; 'when'/'monthly'/'trend' -> a date field).\n"
     '- Quote column names that contain spaces with double quotes, e.g. "Order Date".\n'
     "- Cast text date columns before date math: CAST(\"Order Date\" AS DATE).\n"
+    "- For time trends, bucket by the requested grain (day/week/month/quarter/year): "
+    "month/year via strftime(CAST(<date> AS DATE), '%Y-%m' or '%Y'); "
+    "day/week/quarter via date_trunc('week'|'day'|'quarter', CAST(<date> AS DATE)). "
+    "GROUP BY and ORDER BY that period.\n"
+    "- Prefer returning SEVERAL metric columns when the user wants to see multiple "
+    "measures (e.g. SELECT ..., SUM(\"Revenue\") AS revenue, SUM(\"Orders\") AS orders, "
+    "SUM(\"Quantity\") AS quantity). Order by the primary metric.\n"
+    "- SUPPORT TWO-DIMENSION BREAKDOWNS. If the question asks for a metric by a time "
+    "period AND a category (e.g. 'monthly revenue by product category'), GROUP BY "
+    "BOTH (month, category) and SELECT both grouping columns plus the aggregate. "
+    "Likewise for two categories (e.g. 'revenue by region and segment' -> "
+    "GROUP BY region, segment).\n"
     "- Use SUM for totals, AVG for rates/averages (including 0/1 flags), COUNT for volumes.\n"
     "- Only emit SELECT or WITH statements. Never write/DDL.\n"
     "- If the metric, time window, or which date column to use is genuinely "
     "ambiguous, ask a clarification instead of guessing.\n"
-    "- Pick `intent` to drive chart choice: trend (over time), ranking (top/bottom), "
-    "comparison (by category), share (% of total), correlation (two metrics), "
-    "kpi (single number), detail (raw rows)."
+    "- Pick `intent` to drive chart choice: trend (over time, incl. time x category), "
+    "ranking (top/bottom), comparison (by one or two categories), share (% of total), "
+    "correlation (two metrics), kpi (single number), detail (raw rows).\n"
+    "Examples (schema-dependent — adapt column names to the actual schema):\n"
+    "  Q: 'monthly revenue trend by product category' -> "
+    "SELECT strftime(CAST(\"Order Date\" AS DATE),'%Y-%m') AS month, "
+    "\"Product Category\" AS category, SUM(\"Revenue\") AS revenue "
+    "FROM data GROUP BY month, category ORDER BY month; intent=trend\n"
+    "  Q: 'top 5 regions by revenue' -> SELECT \"Region\", SUM(\"Revenue\") AS revenue "
+    "FROM data GROUP BY \"Region\" ORDER BY revenue DESC LIMIT 5; intent=ranking"
 )
 
 
@@ -163,6 +185,25 @@ def _user_prompt(question: str, profile: Dict[str, Any]) -> str:
         f"Detected date fields: {profile.get('date_fields')}\n\n"
         f"Question: {question}"
     )
+
+
+_AGG_FUNCS = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX"}
+
+
+def apply_aggregation(sql: Optional[str], agg: Optional[str]) -> Optional[str]:
+    """Rewrite the metric aggregate functions in a generated query.
+
+    ``agg`` is one of {sum, avg, min, max} to force that function on every
+    aggregated metric, or None to leave the query as generated. Only SUM/AVG/MIN/
+    MAX are rewritten (COUNT and non-aggregate functions like strftime/date_trunc
+    are untouched), so grouping and time bucketing are preserved.
+    """
+    if not sql or not agg:
+        return sql
+    func = _AGG_FUNCS.get(agg.lower())
+    if not func:
+        return sql
+    return re.sub(r"\b(?:SUM|AVG|MIN|MAX)\s*\(", func + "(", sql, flags=re.IGNORECASE)
 
 
 def _plan_from_dict(d: Dict[str, Any], backend: str) -> QueryPlan:
@@ -282,31 +323,61 @@ def _q(name: str) -> str:
     return f'"{name}"'
 
 
-def _find_column(question_l: str, candidates: List[str]) -> Optional[str]:
-    """Return the candidate column best matched in the question.
-
-    Matches a substring first; otherwise requires every token of the column to
-    appear in the question by a prefix match, so 'Product Category' matches
-    'product categories'. Prefers the column with the most matched tokens.
-    """
+def _col_matches(question_l: str, col: str) -> bool:
+    """True if the column is mentioned in the question (substring or every token
+    matched by a >=4-char prefix, so 'Product Category' matches 'product categories')."""
+    cl = col.lower()
+    if cl in question_l:
+        return True
     q_words = re.findall(r"[a-z0-9]+", question_l)
-    best: Optional[str] = None
-    best_score = 0
-    for col in candidates:
-        cl = col.lower()
-        if cl in question_l:
-            return col
-        tokens = re.findall(r"[a-z0-9]+", cl)
-        if tokens and all(_token_in_words(t, q_words) for t in tokens):
-            if len(tokens) > best_score:
-                best, best_score = col, len(tokens)
-    return best
+    tokens = re.findall(r"[a-z0-9]+", cl)
+    return bool(tokens) and all(_token_in_words(t, q_words) for t in tokens)
+
+
+def _find_column(question_l: str, candidates: List[str]) -> Optional[str]:
+    """Return the single candidate column best matched in the question."""
+    matched = [c for c in candidates if _col_matches(question_l, c)]
+    # Prefer a substring match, then the most specific (most tokens).
+    matched.sort(key=lambda c: (c.lower() in question_l, len(re.findall(r"[a-z0-9]+", c))), reverse=True)
+    return matched[0] if matched else None
+
+
+def _mentioned_columns(question_l: str, candidates: List[str]) -> List[str]:
+    """All candidate columns explicitly mentioned in the question, in schema order."""
+    return [c for c in candidates if _col_matches(question_l, c)]
 
 
 def _token_in_words(token: str, words: List[str]) -> bool:
     """True if some question word shares a >=4-char prefix with the column token."""
     prefix = token[:4]
     return any(w.startswith(prefix) or token.startswith(w[:4]) for w in words)
+
+
+def _time_grain(question_l: str) -> str:
+    """Detect the requested time granularity; defaults to month."""
+    if "week" in question_l:
+        return "week"
+    if "quarter" in question_l or "quarterly" in question_l:
+        return "quarter"
+    if any(w in question_l for w in ["yearly", "annual", "by year", "per year", "each year"]):
+        return "year"
+    if any(w in question_l for w in ["daily", "by day", "per day", "each day"]):
+        return "day"
+    return "month"
+
+
+def _period_sql(date_col: str, grain: str) -> str:
+    """DuckDB expression that buckets a (possibly text) date column by ``grain``.
+
+    Month/year return a readable, sortable text label; day/week/quarter return a
+    sortable DATE (the first day of the bucket) which plots on a time axis.
+    """
+    d = f'CAST({_q(date_col)} AS DATE)'
+    if grain == "month":
+        return f"strftime({d}, '%Y-%m')"
+    if grain == "year":
+        return f"strftime({d}, '%Y')"
+    return f"CAST(date_trunc('{grain}', {d}) AS DATE)"
 
 
 def _generate_heuristic(question: str, profile: Dict[str, Any]) -> QueryPlan:
@@ -322,59 +393,100 @@ def _generate_heuristic(question: str, profile: Dict[str, Any]) -> QueryPlan:
             confidence="low",
         )
 
-    metric = _find_column(ql, metrics) or (metrics[0] if metrics else None)
-    dimension = _find_column(ql, dimensions) or (dimensions[0] if dimensions else None)
+    mentioned_dims = _mentioned_columns(ql, dimensions)
+    mentioned_metrics = _mentioned_columns(ql, metrics)
+    primary_metric = mentioned_metrics[0] if mentioned_metrics else (metrics[0] if metrics else None)
+    dimension = mentioned_dims[0] if mentioned_dims else None
     date_col = _find_column(ql, dates) or (dates[0] if dates else None)
 
     assumptions: List[str] = []
-    if metric and not _find_column(ql, metrics):
-        assumptions.append(f"Assumed the metric is '{metric}'.")
+    if primary_metric and not mentioned_metrics:
+        assumptions.append(f"Assumed the metric is '{primary_metric}'.")
     if len(dates) > 1 and date_col:
         assumptions.append(f"Assumed the date field is '{date_col}' (of {dates}).")
 
     def agg(m: str) -> str:
         return f"AVG({_q(m)})" if _is_rate_metric(m, profile) else f"SUM({_q(m)})"
 
-    is_trend = any(w in ql for w in ["trend", "over time", "by month", "by day", "monthly", "daily", "by week"])
+    grain = _time_grain(ql)
+
+    # Show the primary metric plus the other detected metrics so the table is
+    # rich (capped for readability); the primary metric drives chart + ordering.
+    metric_list = (
+        ([primary_metric] + [m for m in metrics if m != primary_metric])[:4]
+        if primary_metric else []
+    )
+    metric_select = ", ".join(f"{agg(m)} AS {_safe(m)}" for m in metric_list)
+    primary_alias = _safe(primary_metric) if primary_metric else None
+
+    is_trend = any(w in ql for w in ["trend", "over time", "by month", "by day", "by week",
+                                     "monthly", "daily", "weekly", "quarterly", "yearly",
+                                     "per month", "per week", "per day", "each month",
+                                     "each week", "quarter", "annual"])
     is_share = any(w in ql for w in ["share", "percentage", "percent", "% of", "proportion", "contribution"])
     is_rank = any(w in ql for w in ["top", "highest", "lowest", "best", "worst", "rank", "most", "least", "bottom"])
 
-    if is_trend and metric and date_col:
+    # Trend over time at the requested grain, optionally broken down by a category.
+    if is_trend and primary_metric and date_col:
+        period = _period_sql(date_col, grain)
+        cat = mentioned_dims[0] if mentioned_dims else None
+        if cat:
+            sql = (
+                f"SELECT {period} AS {grain}, {_q(cat)} AS {_safe(cat)}, {metric_select} "
+                f"FROM data GROUP BY {grain}, {_q(cat)} ORDER BY {grain}, {primary_alias} DESC"
+            )
+            return QueryPlan(sql=sql, intent="trend", assumptions=assumptions,
+                             columns_used=[date_col, cat] + metric_list, confidence="medium")
         sql = (
-            f"SELECT strftime(CAST({_q(date_col)} AS DATE), '%Y-%m') AS month, "
-            f"{agg(metric)} AS {_safe(metric)} "
-            f"FROM data GROUP BY month ORDER BY month"
+            f"SELECT {period} AS {grain}, {metric_select} "
+            f"FROM data GROUP BY {grain} ORDER BY {grain}"
         )
         return QueryPlan(sql=sql, intent="trend", assumptions=assumptions,
-                         columns_used=[date_col, metric], confidence="medium")
+                         columns_used=[date_col] + metric_list, confidence="medium")
 
-    if is_share and metric and dimension:
+    # Two categorical dimensions (e.g. revenue by region and segment).
+    if primary_metric and len(mentioned_dims) >= 2 and not is_share:
+        d1, d2 = mentioned_dims[0], mentioned_dims[1]
+        sql = (
+            f"SELECT {_q(d1)} AS {_safe(d1)}, {_q(d2)} AS {_safe(d2)}, {metric_select} "
+            f"FROM data GROUP BY {_q(d1)}, {_q(d2)} ORDER BY {primary_alias} DESC"
+        )
+        return QueryPlan(sql=sql, intent="comparison", assumptions=assumptions,
+                         columns_used=[d1, d2] + metric_list, confidence="medium")
+
+    # Share of total by a dimension (single metric + its percentage of the total).
+    if is_share and primary_metric and dimension:
         sql = (
             f"SELECT {_q(dimension)} AS {_safe(dimension)}, "
-            f"{agg(metric)} AS {_safe(metric)}, "
-            f"100.0 * {agg(metric)} / (SELECT {agg(metric)} FROM data) AS pct_of_total "
-            f"FROM data GROUP BY {_q(dimension)} ORDER BY {_safe(metric)} DESC"
+            f"{agg(primary_metric)} AS {primary_alias}, "
+            f"100.0 * {agg(primary_metric)} / (SELECT {agg(primary_metric)} FROM data) AS pct_of_total "
+            f"FROM data GROUP BY {_q(dimension)} ORDER BY {primary_alias} DESC"
         )
         return QueryPlan(sql=sql, intent="share", assumptions=assumptions,
-                         columns_used=[dimension, metric], confidence="medium")
+                         columns_used=[dimension, primary_metric], confidence="medium")
 
-    if metric and dimension:
+    # Ranking / comparison by one dimension.
+    if primary_metric and dimension:
         n = _extract_top_n(ql)
         order = "ASC" if any(w in ql for w in ["lowest", "worst", "bottom", "least"]) else "DESC"
         limit = f" LIMIT {n}" if n else ""
         sql = (
-            f"SELECT {_q(dimension)} AS {_safe(dimension)}, "
-            f"{agg(metric)} AS {_safe(metric)} "
-            f"FROM data GROUP BY {_q(dimension)} ORDER BY {_safe(metric)} {order}{limit}"
+            f"SELECT {_q(dimension)} AS {_safe(dimension)}, {metric_select} "
+            f"FROM data GROUP BY {_q(dimension)} ORDER BY {primary_alias} {order}{limit}"
         )
         intent = "ranking" if (is_rank or n) else "comparison"
         return QueryPlan(sql=sql, intent=intent, assumptions=assumptions,
-                         columns_used=[dimension, metric], confidence="medium")
+                         columns_used=[dimension] + metric_list, confidence="medium")
 
-    if metric:
-        sql = f"SELECT {agg(metric)} AS {_safe(metric)} FROM data"
+    # No dimension: a one-row summary of the detected metrics.
+    if primary_metric:
+        if len(metric_list) > 1:
+            sql = f"SELECT {metric_select} FROM data"
+            return QueryPlan(sql=sql, intent="detail", assumptions=assumptions,
+                             columns_used=metric_list, confidence="low")
+        sql = f"SELECT {agg(primary_metric)} AS {primary_alias} FROM data"
         return QueryPlan(sql=sql, intent="kpi", assumptions=assumptions,
-                         columns_used=[metric], confidence="low")
+                         columns_used=[primary_metric], confidence="low")
 
     return QueryPlan(
         clarification="Which metric would you like to analyse, and broken down by "
