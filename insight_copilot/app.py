@@ -23,11 +23,22 @@ from insight_copilot.charts import recommend_chart, build_figure
 from insight_copilot.trust import build_trust_panel, check_insight_faithfulness
 from insight_copilot.nl2sql import (
     generate_query,
+    apply_aggregation,
     resolve_provider,
     model_for,
     SUGGESTED_FREE_MODELS,
     SUGGESTED_ANTHROPIC_MODELS,
 )
+
+# Aggregation choices for the Ask tab. Maps the UI label to the SQL function
+# (None = leave the query's default: sum, or average for rate columns).
+_AGG_OPTIONS = {
+    "Auto (sum / avg for rates)": None,
+    "Sum": "sum",
+    "Average": "avg",
+    "Minimum": "min",
+    "Maximum": "max",
+}
 from insight_copilot.evaluate import run_suite
 
 st.set_page_config(page_title="Insight Copilot", page_icon="📊", layout="wide")
@@ -192,10 +203,21 @@ def _screen_ask() -> None:
         st.warning(f"**Clarification needed:** {plan.clarification}")
         return
 
-    result = run_sql(path, plan.sql)
+    # Aggregation control — instantly rewrites SUM/AVG/MIN/MAX in the generated
+    # query without re-calling the model.
+    agg_label = st.selectbox(
+        "Aggregate metrics using",
+        list(_AGG_OPTIONS),
+        key="ask_agg",
+        help="Applies to the numeric metric columns. 'Auto' uses sum (average for "
+        "rate columns such as a 0/1 flag).",
+    )
+    sql = apply_aggregation(plan.sql, _AGG_OPTIONS[agg_label])
+
+    result = run_sql(path, sql)
     if not result.ok:
         st.error(f"Query failed: {result.error}")
-        st.code(plan.sql, language="sql")
+        st.code(sql, language="sql")
         return
 
     df = pd.DataFrame(result.rows)
@@ -220,16 +242,17 @@ def _screen_ask() -> None:
     # Trust panel (PRD 7.8).
     faith = check_insight_faithfulness(insight, df)
     panel = build_trust_panel(
-        sql=plan.sql,
+        sql=sql,
         result_df=df,
         columns_used=plan.columns_used,
         assumptions=plan.assumptions,
         confidence=plan.confidence,
-        aggregation=None,
+        aggregation=agg_label,
         warnings=[] if faith["faithful"] else ["Insight cites numbers not in the result."],
     )
     with st.expander("How this was calculated"):
         st.markdown(f"**Confidence:** {panel['confidence']}  ·  **Engine:** {plan.backend}")
+        st.write("**Aggregation:**", panel["aggregation"])
         st.code(panel["query"], language="sql")
         st.write("**Columns used:**", ", ".join(panel["columns_used"]) or "—")
         st.write("**Assumptions:**")
@@ -320,8 +343,21 @@ def main() -> None:
         _screen_eval()
 
 
-try:
-    main()
-except Exception as exc:  # noqa: BLE001 -- surface errors instead of a blank screen
-    st.error("The app hit an error while rendering. Details below:")
-    st.exception(exc)
+def run() -> None:
+    """Render the app, surfacing errors instead of a blank screen.
+
+    Must be CALLED on every Streamlit run. Do not rely on import side effects:
+    the deployment entrypoint (streamlit_app.py) imports this module once, so a
+    bottom-of-module main() call would only render on first load and blank on
+    every rerun.
+    """
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 -- surface errors instead of a blank screen
+        st.error("The app hit an error while rendering. Details below:")
+        st.exception(exc)
+
+
+if __name__ == "__main__":
+    # Runs when launched directly: `streamlit run insight_copilot/app.py`.
+    run()
