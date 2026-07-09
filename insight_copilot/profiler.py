@@ -27,6 +27,32 @@ def load_dataframe(path: str) -> pd.DataFrame:
     return pd.read_csv(path, sep=sep)
 
 
+import re as _re
+
+
+def _detect_dayfirst(sample: pd.Series) -> bool:
+    """True if the values look day-first (dd/mm/yyyy) rather than month-first.
+
+    A value whose first number is >12 can only be a day, so it settles the format
+    for the whole column (e.g. '15/06/2023' -> day 15). Defaults to False (ISO /
+    US month-first) when nothing is decisive.
+    """
+    for v in sample:
+        m = _re.match(r"\s*(\d{1,2})[/\-.](\d{1,2})[/\-.]\d{2,4}", str(v))
+        if m and int(m.group(1)) > 12:
+            return True
+    return False
+
+
+def parse_date_series(series: pd.Series) -> pd.Series:
+    """Parse a (possibly text) column into datetime, honouring dd/mm/yyyy order."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    sample = series.dropna().astype(str).head(50)
+    dayfirst = _detect_dayfirst(sample)
+    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst, format="mixed")
+
+
 def _looks_like_date(series: pd.Series) -> bool:
     """Best-effort detection of a date/datetime column."""
     if pd.api.types.is_datetime64_any_dtype(series):
@@ -36,9 +62,31 @@ def _looks_like_date(series: pd.Series) -> bool:
     sample = series.dropna().astype(str).head(25)
     if sample.empty:
         return False
-    parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+    parsed = pd.to_datetime(sample, errors="coerce", dayfirst=_detect_dayfirst(sample), format="mixed")
     # Require most of the sample to parse to avoid false positives on free text.
     return parsed.notna().mean() >= 0.8
+
+
+def coerce_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert detected date columns to real datetime64 dtype.
+
+    DuckDB's CAST(... AS DATE) only accepts ISO 'YYYY-MM-DD' text, so leaving
+    dd/mm/yyyy (or other) date strings as-is makes time bucketing (strftime /
+    date_trunc) fail. Parsing them here — once, with day-first detection — means
+    the registered ``data`` table has genuine TIMESTAMP columns that group by
+    month/week/quarter correctly regardless of the original text format.
+    """
+    out = df.copy()
+    for col in out.columns:
+        s = out[col]
+        if pd.api.types.is_datetime64_any_dtype(s) or not pd.api.types.is_object_dtype(s):
+            continue
+        if not _looks_like_date(s):
+            continue
+        parsed = parse_date_series(s)
+        if parsed.notna().mean() >= 0.8:
+            out[col] = parsed
+    return out
 
 
 _ID_SUFFIXES = ("id", "_id", "code", "key", "uuid", "guid", "number", "no")
@@ -59,17 +107,53 @@ def _looks_like_identifier(name: str, series: pd.Series, n_rows: int) -> bool:
     return False
 
 
+def _date_options(series: pd.Series) -> Dict[str, Any]:
+    """Distinct years and months present in a date column, for the UI date filter."""
+    dt = parse_date_series(series).dropna()
+    if dt.empty:
+        return {"years": [], "months": [], "min": None, "max": None}
+    return {
+        "years": sorted(int(y) for y in dt.dt.year.unique()),
+        "months": sorted(int(m) for m in dt.dt.month.unique()),
+        "min": dt.min().date().isoformat(),
+        "max": dt.max().date().isoformat(),
+    }
+
+
+def _looks_like_year(name: str, series: pd.Series) -> bool:
+    """A numeric column that holds calendar years (e.g. 2023, 2024) — a time
+    dimension you group by, not a metric you sum."""
+    lname = name.strip().lower()
+    name_hint = lname in {"year", "yr", "fy", "fiscal year", "fiscal_year"} or lname.endswith(("year", "_yr"))
+    if not pd.api.types.is_numeric_dtype(series):
+        return name_hint
+    s = series.dropna()
+    if s.empty:
+        return name_hint
+    try:
+        if not (s % 1 == 0).all():  # years are whole numbers
+            return False
+        vals = s.astype("int64")
+    except (TypeError, ValueError):
+        return False
+    in_range = vals.between(1900, 2100).mean() >= 0.95
+    # Name says year -> just needs plausible values; otherwise require a small,
+    # year-like set of distinct values so real metrics aren't misclassified.
+    return in_range and (name_hint or vals.nunique() <= 60)
+
+
 def classify_column(name: str, series: pd.Series, n_rows: int) -> str:
     """Return one of 'date', 'metric', or 'dimension' for a column.
 
     Numeric columns are metrics by default — including 0/1 outcome flags such as
     ``converted``, which are meaningful when averaged (conversion rate). Numeric
-    identifiers (``user_id``) are treated as dimensions, not metrics.
+    identifiers (``user_id``) and calendar years (``2024``) are treated as
+    dimensions, not metrics.
     """
     if _looks_like_date(series):
         return "date"
     if pd.api.types.is_numeric_dtype(series):
-        if _looks_like_identifier(name, series, n_rows):
+        if _looks_like_identifier(name, series, n_rows) or _looks_like_year(name, series):
             return "dimension"
         return "metric"
     return "dimension"  # text groups better than it aggregates, whatever its cardinality
@@ -110,6 +194,8 @@ def profile_dataset(path: str, preview_rows: int = 5) -> Dict[str, Any]:
         if c["missing_pct"] >= 10
     ]
 
+    date_options = {col: _date_options(df[col]) for col in dates}
+
     return {
         "path": path,
         "n_rows": n_rows,
@@ -119,6 +205,7 @@ def profile_dataset(path: str, preview_rows: int = 5) -> Dict[str, Any]:
         "metrics": metrics,
         "dimensions": dimensions,
         "date_fields": dates,
+        "date_options": date_options,
         "summary": _summary_text(n_rows, metrics, dimensions, dates),
         "suggested_questions": suggest_questions(metrics, dimensions, dates),
         "quality_warnings": quality_warnings,

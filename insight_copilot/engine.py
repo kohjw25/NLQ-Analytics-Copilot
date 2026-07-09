@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import duckdb
 import pandas as pd
 
-from .profiler import load_dataframe
+from .profiler import coerce_date_columns, load_dataframe, parse_date_series
 
 TABLE_NAME = "data"
 
@@ -64,20 +64,59 @@ def assert_read_only(sql: str) -> None:
         raise UnsafeQueryError("Query contains a forbidden (write/DDL) keyword.")
 
 
-def make_connection(path: str) -> duckdb.DuckDBPyConnection:
-    """Load a file and register it as the ``data`` table in a DuckDB connection."""
+def apply_date_filter(df: pd.DataFrame, date_filter: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    """Filter rows by year/month and/or a date range on a datetime column.
+
+    ``date_filter`` = {"column": <name>, "years": [...], "months": [...],
+    "start": <ISO date>, "end": <ISO date>}. Empty/missing entries mean "no
+    restriction" on that dimension. ``start``/``end`` are inclusive bounds.
+    """
+    if not date_filter:
+        return df
+    col = date_filter.get("column")
+    if not col or col not in df.columns:
+        return df
+    dt = parse_date_series(df[col])
+    mask = dt.notna()
+    years = date_filter.get("years")
+    months = date_filter.get("months")
+    start = date_filter.get("start")
+    end = date_filter.get("end")
+    if years:
+        mask &= dt.dt.year.isin(years)
+    if months:
+        mask &= dt.dt.month.isin(months)
+    if start:
+        mask &= dt >= pd.Timestamp(start)
+    if end:
+        # Inclusive of the whole end day.
+        mask &= dt < pd.Timestamp(end) + pd.Timedelta(days=1)
+    return df[mask]
+
+
+def make_connection(path: str, date_filter: Optional[Dict[str, Any]] = None) -> duckdb.DuckDBPyConnection:
+    """Load a file and register it as the ``data`` table in a DuckDB connection.
+
+    Date columns are parsed to real datetime dtype (so DuckDB time bucketing works
+    regardless of the source text format, e.g. dd/mm/yyyy). If ``date_filter`` is
+    given, rows are filtered before the table is registered, so all generated SQL
+    runs against the filtered data unchanged.
+    """
     df = load_dataframe(path)
+    df = coerce_date_columns(df)
+    df = apply_date_filter(df, date_filter)
     con = duckdb.connect(database=":memory:")
     con.register(TABLE_NAME, df)
     return con
 
 
-def run_sql(path_or_con, sql: str) -> QueryResult:
+def run_sql(path_or_con, sql: str, date_filter: Optional[Dict[str, Any]] = None) -> QueryResult:
     """Execute read-only ``sql`` and return a structured QueryResult.
 
     ``path_or_con`` may be a file path or an existing DuckDB connection.
-    Errors are returned in the result rather than raised, so callers can
-    surface a graceful explanation (PRD 7.4).
+    ``date_filter`` (path inputs only) restricts rows by year/month before the
+    query runs. Errors are returned in the result rather than raised, so callers
+    can surface a graceful explanation (PRD 7.4).
     """
     try:
         assert_read_only(sql)
@@ -88,7 +127,7 @@ def run_sql(path_or_con, sql: str) -> QueryResult:
     own_con = False
     try:
         if isinstance(path_or_con, str):
-            con = make_connection(path_or_con)
+            con = make_connection(path_or_con, date_filter)
             own_con = True
         else:
             con = path_or_con

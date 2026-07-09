@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 from insight_copilot.profiler import profile_dataset
 from insight_copilot.engine import run_sql
-from insight_copilot.charts import recommend_chart, build_figure
+from insight_copilot.charts import recommend_chart, build_figure, CHART_TYPES
 from insight_copilot.trust import build_trust_panel, check_insight_faithfulness
 from insight_copilot.nl2sql import (
     generate_query,
@@ -30,6 +31,8 @@ from insight_copilot.nl2sql import (
     SUGGESTED_ANTHROPIC_MODELS,
 )
 
+from insight_copilot.evaluate import run_suite, self_evaluate
+
 # Aggregation choices for the Ask tab. Maps the UI label to the SQL function
 # (None = leave the query's default: sum, or average for rate columns).
 _AGG_OPTIONS = {
@@ -39,9 +42,30 @@ _AGG_OPTIONS = {
     "Minimum": "min",
     "Maximum": "max",
 }
-from insight_copilot.evaluate import run_suite, self_evaluate
 
-st.set_page_config(page_title="Insight Copilot", page_icon="📊", layout="wide")
+# Chart-type choices for the Ask tab's manual override. Label -> internal type.
+_CHART_LABELS = {
+    "Auto (recommended)": "auto",
+    "Line": "line",
+    "Area": "area",
+    "Bar (grouped)": "bar",
+    "Stacked bar": "stacked_bar",
+    "Horizontal bar": "hbar",
+    "Scatter": "scatter",
+    "Donut": "donut",
+    "Pie": "pie",
+    "Histogram": "histogram",
+    "Box": "box",
+    "Table": "table",
+}
+
+# Rows shown in the dataset preview on the home screen.
+PREVIEW_ROWS = 100
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+st.set_page_config(page_title="Analytics Copilot", page_icon="📊", layout="wide")
 
 
 def _bridge_secrets_to_env() -> None:
@@ -81,8 +105,64 @@ def _persist_upload(uploaded) -> str:
 
 def _load_dataset(path: str) -> None:
     st.session_state["dataset_path"] = path
-    st.session_state["profile"] = profile_dataset(path)
+    st.session_state["profile"] = profile_dataset(path, preview_rows=PREVIEW_ROWS)
     st.session_state.pop("last_answer", None)
+
+
+_DARK_CSS = """
+<style>
+.stApp { background-color: #0e1117; }
+.stApp header { background-color: #0e1117; }
+section[data-testid="stSidebar"] { background-color: #1a1d24; }
+
+/* Force readable text everywhere, including the sidebar and the file uploader's
+   dropzone instructions ("Limit 200MB per file • CSV, XLSX, XLS"). */
+.stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
+.stApp p, .stApp span, .stApp label, .stApp li, .stApp small, .stMarkdown,
+section[data-testid="stSidebar"] *,
+[data-testid="stFileUploaderDropzoneInstructions"] *,
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #fafafa !important; }
+
+/* Dark widget surfaces so the light text stays readable. */
+[data-testid="stFileUploaderDropzone"] { background-color: #262730 !important; border-color: #3d4048 !important; }
+section[data-testid="stSidebar"] button { background-color: #262730 !important; color: #fafafa !important; border-color: #3d4048 !important; }
+.stApp [data-baseweb="input"] input, .stApp textarea { background-color: #262730 !important; color: #fafafa !important; }
+[data-testid="stExpander"] { background-color: #1a1d24 !important; }
+
+/* Dropdowns (BaseWeb select) render their menu in a body-level portal, so these
+   must be GLOBAL, not scoped to the sidebar/app — otherwise the option text is
+   invisible in dark mode. Safe because this whole block only loads in dark mode.
+   The closed control lives entirely inside [data-baseweb="select"] (the open menu
+   is a separate portal), so paint EVERY descendant div dark — the value box can be
+   nested several levels deep, and hitting only the first few left it white. */
+[data-baseweb="select"] div { background-color: #262730 !important; border-color: #3d4048 !important; }
+[data-baseweb="select"], [data-baseweb="select"] *, [data-baseweb="select"] input { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
+/* Higher-specificity backups so a light default theme can't win the cascade for
+   the sidebar model picker (the reported white-on-white case). */
+section[data-testid="stSidebar"] [data-baseweb="select"] div,
+[data-testid="stSelectbox"] div[data-baseweb="select"] div { background-color: #262730 !important; }
+[data-testid="stSelectbox"], [data-testid="stSelectbox"] * { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
+/* Open option menu (suggested models etc.). It's a body-level portal, and the
+   white background sits on a container INSIDE the popover, so darken every
+   descendant — not just the popover/listbox roots — then force white option text. */
+[data-baseweb="popover"], [data-baseweb="popover"] *,
+[data-baseweb="menu"], [data-baseweb="menu"] *,
+ul[role="listbox"], ul[role="listbox"] * { background-color: #262730 !important; }
+[role="option"], [role="option"] *, ul[role="listbox"] li,
+[data-baseweb="menu"] li { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
+[data-baseweb="tag"], [data-baseweb="tag"] * { color: #fafafa !important; }
+</style>
+"""
+
+
+def _apply_theme() -> None:
+    """Inject dark-mode CSS when the toggle is on (read from session state)."""
+    if st.session_state.get("dark_mode"):
+        st.markdown(_DARK_CSS, unsafe_allow_html=True)
+
+
+def chart_template() -> str:
+    return "plotly_dark" if st.session_state.get("dark_mode") else "plotly_white"
 
 
 def _sidebar() -> None:
@@ -101,6 +181,10 @@ def _sidebar() -> None:
     st.sidebar.divider()
     st.sidebar.header("Query engine")
     _model_picker(resolve_provider())
+
+    st.sidebar.divider()
+    st.sidebar.header("Appearance")
+    st.sidebar.toggle("🌙 Dark mode", key="dark_mode")
 
 
 def _model_picker(provider: str) -> None:
@@ -188,9 +272,17 @@ def _screen_ask() -> None:
     suggestions = p.get("suggested_questions", [])
     placeholder = suggestions[0] if suggestions else "e.g. Which region had the highest revenue?"
     question = st.text_input("Your question", value="", placeholder=placeholder)
+
+    # Date settings — which date field to aggregate/filter by, plus an optional
+    # year/month filter. Always visible when the dataset has date columns, and the
+    # chosen field is passed to query generation (so monthly/weekly grouping uses it).
+    agg_date, date_filter, filter_desc = _date_controls(p)
+
     if st.button("Answer", type="primary") and question.strip():
         with st.spinner("Generating query..."):
-            plan = generate_query(question, p, model=st.session_state.get("model"))
+            plan = generate_query(
+                question, p, model=st.session_state.get("model"), date_column=agg_date
+            )
         st.session_state["last_answer"] = {"question": question, "plan": plan}
 
     ans = st.session_state.get("last_answer")
@@ -203,18 +295,25 @@ def _screen_ask() -> None:
         st.warning(f"**Clarification needed:** {plan.clarification}")
         return
 
-    # Aggregation control — instantly rewrites SUM/AVG/MIN/MAX in the generated
-    # query without re-calling the model.
-    agg_label = st.selectbox(
-        "Aggregate metrics using",
-        list(_AGG_OPTIONS),
-        key="ask_agg",
-        help="Applies to the numeric metric columns. 'Auto' uses sum (average for "
-        "rate columns such as a 0/1 flag).",
-    )
+    # Visual controls — aggregation (rewrites SUM/AVG/MIN/MAX in the query without
+    # re-calling the model) and a manual chart-type override.
+    ctrl_agg, ctrl_chart = st.columns(2)
+    with ctrl_agg:
+        agg_label = st.selectbox(
+            "Aggregate metrics using",
+            list(_AGG_OPTIONS),
+            key="ask_agg",
+            help="Applies to the numeric metric columns. 'Auto' uses sum (average "
+            "for rate columns such as a 0/1 flag).",
+        )
+    with ctrl_chart:
+        chart_label = st.selectbox(
+            "Chart type", list(_CHART_LABELS), key="ask_chart",
+            help="'Auto' picks a suitable chart; override it to explore other views.",
+        )
     sql = apply_aggregation(plan.sql, _AGG_OPTIONS[agg_label])
 
-    result = run_sql(path, sql)
+    result = run_sql(path, sql, date_filter=date_filter)
     if not result.ok:
         st.error(f"Query failed: {result.error}")
         st.code(sql, language="sql")
@@ -227,12 +326,39 @@ def _screen_ask() -> None:
     st.markdown("### Answer")
     st.write(insight)
 
+    # Summary KPI tiles — dataset-level totals for every detected metric, shown
+    # after each query for quick reference regardless of what the query selected.
+    _kpi_tiles(path, p, date_filter)
+
+    spec = recommend_chart(
+        plan.intent, df, date_cols=p["date_fields"], chart_type=_CHART_LABELS[chart_label]
+    )
+
+    # Display controls — which metric the chart plots, and axis swap.
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    disp_metric, disp_swap = st.columns(2)
+    with disp_metric:
+        if len(numeric_cols) > 1:
+            metric_field = "x" if spec["chart_type"] == "histogram" else "y"
+            current = spec.get(metric_field)
+            default_idx = numeric_cols.index(current) if current in numeric_cols else 0
+            chosen = st.selectbox(
+                "Metric shown in chart", numeric_cols, index=default_idx, key="ask_metric",
+                help="The chart plots one metric; the table still shows all of them.",
+            )
+            spec[metric_field] = chosen
+            other = spec.get("x") if metric_field == "y" else spec.get("y")
+            spec["title"] = f"{chosen} by {other}" if other else chosen
+    with disp_swap:
+        swap = st.toggle("Swap X / Y axis", key="ask_swap")
+
     # Chart + table.
     col_chart, col_table = st.columns([3, 2])
-    spec = recommend_chart(plan.intent, df, date_cols=p["date_fields"])
     with col_chart:
         try:
-            st.plotly_chart(build_figure(spec, df), width="stretch")
+            st.plotly_chart(
+                build_figure(spec, df, template=chart_template(), swap=swap), width="stretch"
+            )
         except Exception:
             st.dataframe(df, width="stretch")
         st.caption(f"Chart: {spec['chart_type']} ({spec['reason']})")
@@ -248,11 +374,13 @@ def _screen_ask() -> None:
         assumptions=plan.assumptions,
         confidence=plan.confidence,
         aggregation=agg_label,
+        filters=[filter_desc] if filter_desc else [],
         warnings=[] if faith["faithful"] else ["Insight cites numbers not in the result."],
     )
     with st.expander("How this was calculated"):
         st.markdown(f"**Confidence:** {panel['confidence']}  ·  **Engine:** {plan.backend}")
         st.write("**Aggregation:**", panel["aggregation"])
+        st.write("**Filters:**", "; ".join(panel["filters"]) or "none")
         st.code(panel["query"], language="sql")
         st.write("**Columns used:**", ", ".join(panel["columns_used"]) or "—")
         st.write("**Assumptions:**")
@@ -260,6 +388,95 @@ def _screen_ask() -> None:
             st.write(f"- {a}")
         for w in panel["warnings"]:
             st.warning(w)
+
+
+def _kpi_tiles(path, profile, date_filter) -> None:
+    """Render one KPI tile per detected metric (dataset-level, respecting the date
+    filter). Shown after every query so key totals are always at hand, whether or
+    not the current query includes them. Uses AVG for rate metrics, else SUM."""
+    from insight_copilot.nl2sql import _is_rate_metric
+
+    metrics = profile.get("metrics", [])
+    if not metrics:
+        return
+    exprs = [
+        f'{"AVG" if _is_rate_metric(m, profile) else "SUM"}("{m}") AS "{m}"'
+        for m in metrics[:8]
+    ]
+    res = run_sql(path, "SELECT " + ", ".join(exprs) + " FROM data", date_filter=date_filter)
+    if not res.ok or not res.rows:
+        return
+    items = list(res.rows[0].items())
+    scope = " (filtered)" if date_filter else ""
+    st.markdown(f"#### Summary metrics{scope}")
+    for start_i in range(0, len(items), 4):
+        chunk = items[start_i : start_i + 4]
+        for c, (name, val) in zip(st.columns(len(chunk)), chunk):
+            try:
+                c.metric(name, f"{float(val):,.2f}")
+            except (TypeError, ValueError):
+                c.metric(name, "—" if val is None else str(val))
+
+
+def _date_controls(profile):
+    """Date field + optional year/month filter for the loaded dataset.
+
+    Returns (agg_date_column, date_filter dict|None, filter description). The
+    chosen date column governs both time aggregation (passed to query generation)
+    and the row filter, so datasets with several date fields can pick which one.
+    """
+    date_fields = profile.get("date_fields", [])
+    if not date_fields:
+        return None, None, ""
+
+    # Always render the date-field dropdown (even for a single date field) so the
+    # column driving aggregation/filtering is explicit and selectable in the
+    # visualisation area, not hidden when there's only one candidate.
+    col = st.selectbox(
+        "Date field to use", date_fields, key="ask_datecol",
+        help="Which date column to aggregate by (monthly/weekly) and filter on.",
+    )
+
+    opts = profile.get("date_options", {}).get(col, {})
+    start = end = None
+    with st.expander("📅 Date filter (optional)"):
+        st.caption(f"Aggregation and filtering use **{col}**.")
+        c_year, c_month = st.columns(2)
+        # Key widgets per-column so switching date columns doesn't carry over a
+        # selection that isn't valid for the new column's options.
+        with c_year:
+            years = st.multiselect("Year(s)", opts.get("years", []), key=f"ask_years::{col}")
+        with c_month:
+            month_nums = opts.get("months") or list(range(1, 13))
+            months = st.multiselect(
+                "Month(s)", month_nums, key=f"ask_months::{col}",
+                format_func=lambda m: _MONTHS[m - 1],
+            )
+        # Date-range picker: restrict analysis to an exact window (inclusive).
+        lo, hi = opts.get("min"), opts.get("max")
+        if lo and hi:
+            lo_d, hi_d = date.fromisoformat(lo), date.fromisoformat(hi)
+            use_range = st.checkbox("Filter by date range", key=f"ask_use_range::{col}")
+            if use_range:
+                picked = st.date_input(
+                    "Date range", value=(lo_d, hi_d), min_value=lo_d, max_value=hi_d,
+                    key=f"ask_range::{col}",
+                    help="Only rows whose date falls in this window are analysed.",
+                )
+                if isinstance(picked, (tuple, list)) and len(picked) == 2:
+                    start, end = picked[0].isoformat(), picked[1].isoformat()
+
+    if not years and not months and not start and not end:
+        return col, None, ""
+    parts = []
+    if start or end:
+        parts.append(f"{start or lo} to {end or hi}")
+    if years:
+        parts.append("year " + ", ".join(str(y) for y in years))
+    if months:
+        parts.append("month " + ", ".join(_MONTHS[m - 1] for m in months))
+    date_filter = {"column": col, "years": years, "months": months, "start": start, "end": end}
+    return col, date_filter, f"{col}: " + "; ".join(parts)
 
 
 def _build_insight(question: str, df: pd.DataFrame, intent: str) -> str:
@@ -378,8 +595,14 @@ def _screen_eval() -> None:
 # --- main ---------------------------------------------------------------------
 
 def main() -> None:
-    st.title("📊 Insight Copilot")
-    st.caption("Ask questions of your data in plain English — validated queries, charts, and insights.")
+    _apply_theme()
+    st.title("📊 Analytics Copilot")
+    st.subheader("Derive insights without code")
+    st.caption(
+        "Upload a spreadsheet, ask questions in plain English, and get validated "
+        "tables, charts, and written insights — no SQL or BI skills required. Load a "
+        "dataset from the sidebar to begin."
+    )
     _sidebar()
     tab_profile, tab_ask, tab_eval = st.tabs(["Upload & Profile", "Ask", "Evaluation"])
     with tab_profile:

@@ -107,24 +107,68 @@ def generate_query(
     question: str,
     profile: Dict[str, Any],
     model: Optional[str] = None,
+    date_column: Optional[str] = None,
 ) -> QueryPlan:
     """Generate a QueryPlan for ``question`` against a profiled dataset.
 
-    Tries the resolved LLM provider, falling back to the rule-based generator on
-    any error. Never raises for a normal question -- returns a plan whose
-    ``clarification`` is set instead of ``sql`` when intent can't be resolved.
+    ``date_column`` (optional) forces which date field is used for time-based
+    grouping — useful when the dataset has several date columns. Tries the
+    resolved LLM provider, falling back to the rule-based generator on any error.
+    Never raises for a normal question -- returns a plan whose ``clarification`` is
+    set instead of ``sql`` when intent can't be resolved.
     """
     provider = resolve_provider()
     try:
         if provider == "openrouter":
-            return _generate_with_openrouter(question, profile, model or model_for(provider))
-        if provider == "anthropic":
-            return _generate_with_claude(question, profile, model or model_for(provider))
+            plan = _generate_with_openrouter(question, profile, model or model_for(provider), date_column)
+        elif provider == "anthropic":
+            plan = _generate_with_claude(question, profile, model or model_for(provider), date_column)
+        else:
+            plan = _generate_heuristic(question, profile, date_column)
     except Exception as exc:  # noqa: BLE001 -- degrade to heuristic rather than fail
-        plan = _generate_heuristic(question, profile)
+        plan = _generate_heuristic(question, profile, date_column)
         plan.assumptions.append(f"(LLM backend '{provider}' failed: {exc}; used rule-based fallback)")
         return plan
-    return _generate_heuristic(question, profile)
+    # Safety net: if the user asked for a time grain but the model grouped by the
+    # raw date column (common with weaker models), bucket it deterministically.
+    plan.sql = _enforce_time_bucketing(plan.sql, date_column, question, profile)
+    return plan
+
+
+def _enforce_time_bucketing(
+    sql: Optional[str], date_column: Optional[str], question: str, profile: Dict[str, Any]
+) -> Optional[str]:
+    """Rewrite a query that GROUPs BY a raw date column to bucket by the requested
+    grain (month/week/etc.). No-op unless the question asks for a time grain, a date
+    column is grouped raw, and the query isn't already bucketed (strftime/date_trunc)."""
+    if not sql:
+        return sql
+    ql = question.lower()
+    wants_time = any(
+        w in ql for w in ["trend", "over time", "by month", "by day", "by week",
+                          "by quarter", "by year", "monthly", "daily", "weekly",
+                          "quarterly", "yearly", "per month", "per week", "per day",
+                          "each month", "each week", "quarter", "annual"]
+    )
+    if not wants_time:
+        return sql
+    low = sql.lower()
+    if "strftime" in low or "date_trunc" in low:
+        return sql  # already bucketed
+    col = date_column if date_column in profile.get("date_fields", []) else _find_column(ql, profile.get("date_fields", []))
+    if not col:
+        return sql
+    qcol = _q(col)
+    gb = low.find("group by")
+    # Only act when the raw date column is actually a grouping key.
+    if qcol.lower() not in low or gb == -1 or qcol.lower() not in low[gb:]:
+        return sql
+    grain = _time_grain(ql)
+    period = _period_sql(col, grain)
+    # Alias the SELECT occurrence for a clean column name, then reference the alias
+    # in GROUP BY / ORDER BY (DuckDB resolves aliases there).
+    aliased = sql.replace(qcol, f"{period} AS {grain}", 1)
+    return aliased.replace(qcol, grain)
 
 
 # --- shared prompt ------------------------------------------------------------
@@ -177,12 +221,18 @@ def _schema_text(profile: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _user_prompt(question: str, profile: Dict[str, Any]) -> str:
+def _user_prompt(question: str, profile: Dict[str, Any], date_column: Optional[str] = None) -> str:
+    date_line = (
+        f'For ANY time-based grouping (monthly/weekly/etc.), use the "{date_column}" '
+        "date column.\n"
+        if date_column else ""
+    )
     return (
         f"Dataset schema (table `data`):\n{_schema_text(profile)}\n\n"
         f"Detected metrics: {profile.get('metrics')}\n"
         f"Detected dimensions: {profile.get('dimensions')}\n"
-        f"Detected date fields: {profile.get('date_fields')}\n\n"
+        f"Detected date fields: {profile.get('date_fields')}\n"
+        f"{date_line}\n"
         f"Question: {question}"
     )
 
@@ -238,7 +288,9 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
 # --- OpenRouter backend (OpenAI-compatible) -----------------------------------
 
-def _generate_with_openrouter(question: str, profile: Dict[str, Any], model: str) -> QueryPlan:
+def _generate_with_openrouter(
+    question: str, profile: Dict[str, Any], model: str, date_column: Optional[str] = None
+) -> QueryPlan:
     from openai import OpenAI
 
     client = OpenAI(
@@ -250,7 +302,7 @@ def _generate_with_openrouter(question: str, profile: Dict[str, Any], model: str
             "X-Title": "Insight Copilot",
         },
     )
-    user = _user_prompt(question, profile) + (
+    user = _user_prompt(question, profile, date_column) + (
         "\n\nRespond with ONLY a JSON object (no markdown fences, no commentary) "
         "with keys: clarification (string or null), sql (string or null), "
         f"intent (one of {_INTENTS}), assumptions (array of strings), "
@@ -275,7 +327,9 @@ def _generate_with_openrouter(question: str, profile: Dict[str, Any], model: str
 
 # --- Anthropic backend --------------------------------------------------------
 
-def _generate_with_claude(question: str, profile: Dict[str, Any], model: str) -> QueryPlan:
+def _generate_with_claude(
+    question: str, profile: Dict[str, Any], model: str, date_column: Optional[str] = None
+) -> QueryPlan:
     import anthropic
     from pydantic import BaseModel, Field
 
@@ -300,7 +354,7 @@ def _generate_with_claude(question: str, profile: Dict[str, Any], model: str) ->
         model=model,
         max_tokens=2048,
         system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": _user_prompt(question, profile)}],
+        messages=[{"role": "user", "content": _user_prompt(question, profile, date_column)}],
         output_format=QueryPlanOut,
     )
     out = resp.parsed_output
@@ -380,7 +434,9 @@ def _period_sql(date_col: str, grain: str) -> str:
     return f"CAST(date_trunc('{grain}', {d}) AS DATE)"
 
 
-def _generate_heuristic(question: str, profile: Dict[str, Any]) -> QueryPlan:
+def _generate_heuristic(
+    question: str, profile: Dict[str, Any], date_column: Optional[str] = None
+) -> QueryPlan:
     ql = question.lower()
     metrics: List[str] = profile.get("metrics", [])
     dimensions: List[str] = profile.get("dimensions", [])
@@ -397,12 +453,14 @@ def _generate_heuristic(question: str, profile: Dict[str, Any]) -> QueryPlan:
     mentioned_metrics = _mentioned_columns(ql, metrics)
     primary_metric = mentioned_metrics[0] if mentioned_metrics else (metrics[0] if metrics else None)
     dimension = mentioned_dims[0] if mentioned_dims else None
-    date_col = _find_column(ql, dates) or (dates[0] if dates else None)
+    # A caller-chosen date column wins; else a column named in the question; else the first.
+    chosen_date = date_column if date_column in dates else None
+    date_col = chosen_date or _find_column(ql, dates) or (dates[0] if dates else None)
 
     assumptions: List[str] = []
     if primary_metric and not mentioned_metrics:
         assumptions.append(f"Assumed the metric is '{primary_metric}'.")
-    if len(dates) > 1 and date_col:
+    if len(dates) > 1 and date_col and not chosen_date:
         assumptions.append(f"Assumed the date field is '{date_col}' (of {dates}).")
 
     def agg(m: str) -> str:
