@@ -261,6 +261,18 @@ def _screen_profile() -> None:
 
 # --- Screen 2: Ask ------------------------------------------------------------
 
+def _reset_ask() -> None:
+    """Clear the Ask tab for a fresh query: the last result, the question box, and
+    every Ask-tab widget (aggregation, chart type, metric/axis, date field + filters)."""
+    prefixes = (
+        "ask_question", "ask_agg", "ask_chart", "ask_metric", "ask_swap",
+        "ask_datecol", "ask_years::", "ask_months::", "ask_use_range::", "ask_range::",
+    )
+    for key in [k for k in st.session_state if k.startswith(prefixes)]:
+        del st.session_state[key]
+    st.session_state.pop("last_answer", None)
+
+
 def _screen_ask() -> None:
     st.subheader("Ask a question")
     if "profile" not in st.session_state:
@@ -271,14 +283,21 @@ def _screen_ask() -> None:
 
     suggestions = p.get("suggested_questions", [])
     placeholder = suggestions[0] if suggestions else "e.g. Which region had the highest revenue?"
-    question = st.text_input("Your question", value="", placeholder=placeholder)
+    question = st.text_input("Your question", key="ask_question", placeholder=placeholder)
 
     # Date settings — which date field to aggregate/filter by, plus an optional
     # year/month filter. Always visible when the dataset has date columns, and the
     # chosen field is passed to query generation (so monthly/weekly grouping uses it).
     agg_date, date_filter, filter_desc = _date_controls(p)
 
-    if st.button("Answer", type="primary") and question.strip():
+    b_answer, b_reset = st.columns([1, 1])
+    with b_answer:
+        answer_clicked = st.button("Answer", type="primary", width="stretch")
+    with b_reset:
+        st.button("New query", on_click=_reset_ask, width="stretch",
+                  help="Clear the question, filters and result to start fresh.")
+
+    if answer_clicked and question.strip():
         with st.spinner("Generating query..."):
             plan = generate_query(
                 question, p, model=st.session_state.get("model"), date_column=agg_date
