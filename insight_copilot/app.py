@@ -103,66 +103,29 @@ def _persist_upload(uploaded) -> str:
     return tmp.name
 
 
-def _load_dataset(path: str) -> None:
-    st.session_state["dataset_path"] = path
-    st.session_state["profile"] = profile_dataset(path, preview_rows=PREVIEW_ROWS)
+# Ask-tab widget keys whose valid options depend on the dataset or the current
+# result. Cleared on reset AND on dataset load — otherwise a value stored for one
+# dataset/query can be absent from the next one's options, which crashes the
+# selectbox/multiselect at render time.
+_ASK_WIDGET_PREFIXES = (
+    "ask_question", "ask_agg", "ask_chart", "ask_metric", "ask_swap",
+    "ask_datecol", "ask_years::", "ask_months::", "ask_use_range::", "ask_range::",
+)
+
+
+def _clear_ask_state() -> None:
+    """Drop the last answer and every Ask-tab widget's stored state."""
+    for key in [k for k in st.session_state if k.startswith(_ASK_WIDGET_PREFIXES)]:
+        del st.session_state[key]
     st.session_state.pop("last_answer", None)
 
 
-_DARK_CSS = """
-<style>
-.stApp { background-color: #0e1117; }
-.stApp header { background-color: #0e1117; }
-section[data-testid="stSidebar"] { background-color: #1a1d24; }
-
-/* Force readable text everywhere, including the sidebar and the file uploader's
-   dropzone instructions ("Limit 200MB per file • CSV, XLSX, XLS"). */
-.stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
-.stApp p, .stApp span, .stApp label, .stApp li, .stApp small, .stMarkdown,
-section[data-testid="stSidebar"] *,
-[data-testid="stFileUploaderDropzoneInstructions"] *,
-[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #fafafa !important; }
-
-/* Dark widget surfaces so the light text stays readable. */
-[data-testid="stFileUploaderDropzone"] { background-color: #262730 !important; border-color: #3d4048 !important; }
-section[data-testid="stSidebar"] button { background-color: #262730 !important; color: #fafafa !important; border-color: #3d4048 !important; }
-.stApp [data-baseweb="input"] input, .stApp textarea { background-color: #262730 !important; color: #fafafa !important; }
-[data-testid="stExpander"] { background-color: #1a1d24 !important; }
-
-/* Dropdowns (BaseWeb select) render their menu in a body-level portal, so these
-   must be GLOBAL, not scoped to the sidebar/app — otherwise the option text is
-   invisible in dark mode. Safe because this whole block only loads in dark mode.
-   The closed control lives entirely inside [data-baseweb="select"] (the open menu
-   is a separate portal), so paint EVERY descendant div dark — the value box can be
-   nested several levels deep, and hitting only the first few left it white. */
-[data-baseweb="select"] div { background-color: #262730 !important; border-color: #3d4048 !important; }
-[data-baseweb="select"], [data-baseweb="select"] *, [data-baseweb="select"] input { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
-/* Higher-specificity backups so a light default theme can't win the cascade for
-   the sidebar model picker (the reported white-on-white case). */
-section[data-testid="stSidebar"] [data-baseweb="select"] div,
-[data-testid="stSelectbox"] div[data-baseweb="select"] div { background-color: #262730 !important; }
-[data-testid="stSelectbox"], [data-testid="stSelectbox"] * { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
-/* Open option menu (suggested models etc.). It's a body-level portal, and the
-   white background sits on a container INSIDE the popover, so darken every
-   descendant — not just the popover/listbox roots — then force white option text. */
-[data-baseweb="popover"], [data-baseweb="popover"] *,
-[data-baseweb="menu"], [data-baseweb="menu"] *,
-ul[role="listbox"], ul[role="listbox"] * { background-color: #262730 !important; }
-[role="option"], [role="option"] *, ul[role="listbox"] li,
-[data-baseweb="menu"] li { color: #fafafa !important; -webkit-text-fill-color: #fafafa !important; }
-[data-baseweb="tag"], [data-baseweb="tag"] * { color: #fafafa !important; }
-</style>
-"""
-
-
-def _apply_theme() -> None:
-    """Inject dark-mode CSS when the toggle is on (read from session state)."""
-    if st.session_state.get("dark_mode"):
-        st.markdown(_DARK_CSS, unsafe_allow_html=True)
-
-
-def chart_template() -> str:
-    return "plotly_dark" if st.session_state.get("dark_mode") else "plotly_white"
+def _load_dataset(path: str) -> None:
+    st.session_state["dataset_path"] = path
+    st.session_state["profile"] = profile_dataset(path, preview_rows=PREVIEW_ROWS)
+    # Reset Ask-tab widgets so options from a previous dataset can't linger and
+    # crash the next query (e.g. a date field / metric that no longer exists).
+    _clear_ask_state()
 
 
 def _sidebar() -> None:
@@ -181,10 +144,6 @@ def _sidebar() -> None:
     st.sidebar.divider()
     st.sidebar.header("Query engine")
     _model_picker(resolve_provider())
-
-    st.sidebar.divider()
-    st.sidebar.header("Appearance")
-    st.sidebar.toggle("🌙 Dark mode", key="dark_mode")
 
 
 def _model_picker(provider: str) -> None:
@@ -264,13 +223,7 @@ def _screen_profile() -> None:
 def _reset_ask() -> None:
     """Clear the Ask tab for a fresh query: the last result, the question box, and
     every Ask-tab widget (aggregation, chart type, metric/axis, date field + filters)."""
-    prefixes = (
-        "ask_question", "ask_agg", "ask_chart", "ask_metric", "ask_swap",
-        "ask_datecol", "ask_years::", "ask_months::", "ask_use_range::", "ask_range::",
-    )
-    for key in [k for k in st.session_state if k.startswith(prefixes)]:
-        del st.session_state[key]
-    st.session_state.pop("last_answer", None)
+    _clear_ask_state()
 
 
 def _screen_ask() -> None:
@@ -361,6 +314,10 @@ def _screen_ask() -> None:
             metric_field = "x" if spec["chart_type"] == "histogram" else "y"
             current = spec.get(metric_field)
             default_idx = numeric_cols.index(current) if current in numeric_cols else 0
+            # Drop a stale selection from a previous, differently-shaped result so
+            # the selectbox never receives a stored value outside its options.
+            if st.session_state.get("ask_metric") not in numeric_cols:
+                st.session_state.pop("ask_metric", None)
             chosen = st.selectbox(
                 "Metric shown in chart", numeric_cols, index=default_idx, key="ask_metric",
                 help="The chart plots one metric; the table still shows all of them.",
@@ -376,7 +333,7 @@ def _screen_ask() -> None:
     with col_chart:
         try:
             st.plotly_chart(
-                build_figure(spec, df, template=chart_template(), swap=swap), width="stretch"
+                build_figure(spec, df, template="plotly_white", swap=swap), width="stretch"
             )
         except Exception:
             st.dataframe(df, width="stretch")
@@ -614,7 +571,6 @@ def _screen_eval() -> None:
 # --- main ---------------------------------------------------------------------
 
 def main() -> None:
-    _apply_theme()
     st.title("📊 Analytics Copilot")
     st.subheader("Derive insights without code")
     st.caption(
