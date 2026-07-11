@@ -34,6 +34,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # time -- the picker also offers a custom-entry option. Browse the live list at
 # https://openrouter.ai/models?max_price=0
 SUGGESTED_FREE_MODELS = [
+    "openai/gpt-oss-120b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "deepseek/deepseek-chat-v3-0324:free",
     "google/gemini-2.0-flash-exp:free",
