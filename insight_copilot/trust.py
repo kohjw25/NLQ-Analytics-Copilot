@@ -67,7 +67,6 @@ def _collect_result_numbers(df: pd.DataFrame) -> List[float]:
     for col in df.columns:
         if pd.api.types.is_numeric_dtype(df[col]):
             nums.extend(float(v) for v in df[col].dropna().tolist())
-    # Also allow simple derived values: pairwise ratios as percentages.
     return nums
 
 
@@ -89,7 +88,8 @@ def _is_supported(n: float, pool: List[float], tol: float) -> bool:
             continue
         if abs(n - p) <= tol * abs(p):
             return True
-        # allow the number to be a rounded percentage of a pool ratio
+        # Tolerate a cited value that rounds to the same integer as a result cell
+        # (e.g. the insight says "45" for a 45.2 cell).
         if abs(n - round(p, 0)) <= 0.5:
             return True
     return False

@@ -464,15 +464,21 @@ def _build_insight(question: str, df: pd.DataFrame, intent: str) -> str:
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     cat_cols = [c for c in df.columns if c not in num_cols]
     if num_cols and cat_cols:
-        m, d = num_cols[-1], cat_cols[0]
-        top = df.sort_values(m, ascending=False).iloc[0]
-        bottom = df.sort_values(m, ascending=False).iloc[-1]
+        # The primary metric is the first numeric column (queries put it right after
+        # the grouping dimension and order by it); using the last would describe a
+        # secondary measure and contradict the chart/table ordering.
+        m, d = num_cols[0], cat_cols[0]
+        # First->last narrative only makes sense for a single series. With a second
+        # categorical column (time x category), consecutive rows are different
+        # categories, so compare leader vs laggard instead.
+        if intent == "trend" and len(cat_cols) == 1:
+            first, last = df.iloc[0], df.iloc[-1]
+            return f"{m} moved from {first[m]:,.2f} to {last[m]:,.2f} across the period."
+        ordered = df.sort_values(m, ascending=False)
+        top, bottom = ordered.iloc[0], ordered.iloc[-1]
         parts = [f"**{top[d]}** leads with {m} of {top[m]:,.2f}."]
         if len(df) > 1:
             parts.append(f"**{bottom[d]}** is lowest at {bottom[m]:,.2f}.")
-        if intent == "trend":
-            first, last = df.iloc[0], df.iloc[-1]
-            parts = [f"{m} moved from {first[m]:,.2f} to {last[m]:,.2f} across the period."]
         return " ".join(parts)
     return f"Returned {len(df)} rows across {len(df.columns)} columns."
 

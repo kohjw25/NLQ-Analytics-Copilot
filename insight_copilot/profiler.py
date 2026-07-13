@@ -7,6 +7,7 @@ a short metadata summary, and a list of suggested starter questions.
 from __future__ import annotations
 
 import os
+import re as _re
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -25,9 +26,6 @@ def load_dataframe(path: str) -> pd.DataFrame:
         return pd.read_excel(path)
     sep = "\t" if ext == ".tsv" else ","
     return pd.read_csv(path, sep=sep)
-
-
-import re as _re
 
 
 def _detect_dayfirst(sample: pd.Series) -> bool:
@@ -89,13 +87,16 @@ def coerce_date_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-_ID_SUFFIXES = ("id", "_id", "code", "key", "uuid", "guid", "number", "no")
+# Whole-word tokens that mark an identifier column (matched on the last name
+# token, not a raw suffix — so "Amount Paid" / "grid" aren't misread as IDs).
+_ID_TOKENS = {"id", "code", "key", "uuid", "guid", "number", "no"}
 
 
 def _looks_like_identifier(name: str, series: pd.Series, n_rows: int) -> bool:
     """A numeric column that identifies rows rather than measuring them."""
-    lname = name.strip().lower().replace(" ", "_")
-    if lname in {"id", "index"} or lname.endswith(_ID_SUFFIXES):
+    lname = name.strip().lower()
+    tokens = [t for t in _re.split(r"[^a-z0-9]+", lname) if t]
+    if lname in {"id", "index"} or (tokens and tokens[-1] in _ID_TOKENS):
         return True
     # Near-unique integer column with no fractional part reads as an identifier.
     if n_rows and series.nunique(dropna=True) / n_rows > 0.9:

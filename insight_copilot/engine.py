@@ -18,12 +18,26 @@ from .profiler import coerce_date_columns, load_dataframe, parse_date_series
 
 TABLE_NAME = "data"
 
-# Statements the copilot is allowed to run. Everything else is refused.
+# Write/DDL verbs refused anywhere in the query body (defence in depth on top of
+# the single-statement SELECT/WITH-only check). ``replace`` is intentionally NOT
+# here — it's a legitimate DuckDB scalar function. This is scanned only AFTER
+# quoted identifiers and string literals are removed, so a column named
+# "Create Date" or a literal 'delete' can't trigger a false rejection.
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|attach|copy|pragma|"
-    r"replace|truncate|grant|revoke|call|export)\b",
+    r"truncate|grant|revoke|call|export)\b",
     re.IGNORECASE,
 )
+
+# Double-quoted identifiers ("Order Date") and single-quoted string literals
+# ('active'), with SQL's doubled-quote escaping. Stripped before keyword scanning.
+_QUOTED = re.compile(r'"(?:[^"]|"")*"' + r"|'(?:[^']|'')*'")
+
+
+def _strip_literals(sql: str) -> str:
+    """Blank out quoted identifiers and string literals so the forbidden-keyword
+    scan only sees actual SQL keywords, not user column names or string values."""
+    return _QUOTED.sub(" ", sql)
 
 
 class UnsafeQueryError(ValueError):
@@ -55,12 +69,15 @@ def assert_read_only(sql: str) -> None:
     stripped = sql.strip().rstrip(";")
     if not stripped:
         raise UnsafeQueryError("Empty query.")
-    if ";" in stripped:
+    # Strip quoted identifiers / string literals once, then run the structural
+    # checks on that so column names and string values can't trip them.
+    scrubbed = _strip_literals(stripped)
+    if ";" in scrubbed:
         raise UnsafeQueryError("Multiple statements are not allowed.")
     lowered = stripped.lstrip("(").lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         raise UnsafeQueryError("Only SELECT / WITH queries are allowed.")
-    if _FORBIDDEN.search(stripped):
+    if _FORBIDDEN.search(scrubbed):
         raise UnsafeQueryError("Query contains a forbidden (write/DDL) keyword.")
 
 

@@ -120,56 +120,61 @@ def evaluate_case(case: Dict[str, Any], base_dir: str) -> Dict[str, Any]:
     failures: List[str] = []
 
     con = make_connection(dataset)
-
-    # 1. Query validity — does the candidate run at all?
     try:
-        assert_read_only(candidate_sql)
-        cand_df = con.execute(candidate_sql).fetchdf()
-        scores["query_validity"] = 1.0
-    except (UnsafeQueryError, Exception) as exc:  # noqa: BLE001
-        scores["query_validity"] = 0.0
-        failures.append(f"invalid_query: {exc}")
-        con.close()
+        # 1. Query validity — does the candidate run at all?
+        try:
+            assert_read_only(candidate_sql)
+            cand_df = con.execute(candidate_sql).fetchdf()
+            scores["query_validity"] = 1.0
+        except Exception as exc:  # noqa: BLE001 -- UnsafeQueryError is an Exception
+            scores["query_validity"] = 0.0
+            failures.append(f"invalid_query: {exc}")
+            return _finalise(case, scores, failures)
+
+        # A malformed reference query is this case's failure, not a suite-wide crash.
+        try:
+            ref_df = con.execute(reference_sql).fetchdf()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"bad_reference_sql: {exc}")
+            return _finalise(case, scores, failures)
+
+        # 2. Column mapping — did the candidate reference the expected columns?
+        scores["column_mapping"] = _column_mapping_score(candidate_sql, ref_df, case)
+        if scores["column_mapping"] < 1.0:
+            failures.append("wrong_or_missing_column")
+
+        # 3+4+5. Result accuracy (covers aggregation + filter correctness end-to-end).
+        result_match = _frames_equivalent(cand_df, ref_df)
+        scores["result_accuracy"] = 1.0 if result_match else 0.0
+        # Aggregation / filter are diagnostic sub-scores derived from the mismatch.
+        scores["aggregation_accuracy"] = 1.0 if result_match else _agg_score(cand_df, ref_df)
+        scores["filter_accuracy"] = 1.0 if result_match else _filter_score(cand_df, ref_df)
+        if not result_match:
+            failures.extend(_classify_result_failure(cand_df, ref_df))
+
+        # 6. Chart relevance.
+        expected_chart = case.get("expected_chart")
+        candidate_chart = case.get("candidate_chart", expected_chart)
+        if expected_chart is not None:
+            scores["chart_relevance"] = 1.0 if candidate_chart == expected_chart else 0.0
+            if scores["chart_relevance"] == 0.0:
+                failures.append(
+                    f"wrong_chart: got '{candidate_chart}', expected '{expected_chart}'"
+                )
+
+        # 7. Insight faithfulness.
+        insight = case.get("insight")
+        if insight:
+            faith = check_insight_faithfulness(insight, cand_df)
+            scores["insight_faithfulness"] = 1.0 if faith["faithful"] else 0.0
+            if not faith["faithful"]:
+                failures.append(
+                    f"unsupported_insight: numbers {faith['unsupported_numbers']} not in result"
+                )
+
         return _finalise(case, scores, failures)
-
-    ref_df = con.execute(reference_sql).fetchdf()
-
-    # 2. Column mapping — did the candidate reference the expected columns?
-    scores["column_mapping"] = _column_mapping_score(candidate_sql, ref_df, case)
-    if scores["column_mapping"] < 1.0:
-        failures.append("wrong_or_missing_column")
-
-    # 3+4+5. Result accuracy (covers aggregation + filter correctness end-to-end).
-    result_match = _frames_equivalent(cand_df, ref_df)
-    scores["result_accuracy"] = 1.0 if result_match else 0.0
-    # Aggregation / filter are diagnostic sub-scores derived from the mismatch.
-    scores["aggregation_accuracy"] = 1.0 if result_match else _agg_score(cand_df, ref_df)
-    scores["filter_accuracy"] = 1.0 if result_match else _filter_score(cand_df, ref_df)
-    if not result_match:
-        failures.extend(_classify_result_failure(cand_df, ref_df))
-
-    # 6. Chart relevance.
-    expected_chart = case.get("expected_chart")
-    candidate_chart = case.get("candidate_chart", expected_chart)
-    if expected_chart is not None:
-        scores["chart_relevance"] = 1.0 if candidate_chart == expected_chart else 0.0
-        if scores["chart_relevance"] == 0.0:
-            failures.append(
-                f"wrong_chart: got '{candidate_chart}', expected '{expected_chart}'"
-            )
-
-    # 7. Insight faithfulness.
-    insight = case.get("insight")
-    if insight:
-        faith = check_insight_faithfulness(insight, cand_df)
-        scores["insight_faithfulness"] = 1.0 if faith["faithful"] else 0.0
-        if not faith["faithful"]:
-            failures.append(
-                f"unsupported_insight: numbers {faith['unsupported_numbers']} not in result"
-            )
-
-    con.close()
-    return _finalise(case, scores, failures)
+    finally:
+        con.close()
 
 
 def _finalise(case, scores, failures) -> Dict[str, Any]:
@@ -216,12 +221,17 @@ def _frames_equivalent(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     if a.shape != b.shape:
         return False
     try:
-        aa = a.reset_index(drop=True).round(4)
-        bb = b.reset_index(drop=True).round(4)
+        aa = a.reset_index(drop=True)
+        bb = b.reset_index(drop=True)
         # Order matters for ranking questions, so compare positionally.
         aa.columns = range(len(aa.columns))
         bb.columns = range(len(bb.columns))
-        return aa.equals(bb)
+        # check_dtype=False so a COUNT (int) matches a SUM (float) of equal value;
+        # atol tolerates float rounding without the brittle pre-round + exact equals.
+        pd.testing.assert_frame_equal(
+            aa, bb, check_dtype=False, check_exact=False, atol=1e-4, rtol=0
+        )
+        return True
     except Exception:
         return False
 

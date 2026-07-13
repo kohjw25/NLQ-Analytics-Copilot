@@ -166,10 +166,14 @@ def _enforce_time_bucketing(
         return sql
     grain = _time_grain(ql)
     period = _period_sql(col, grain)
-    # Alias the SELECT occurrence for a clean column name, then reference the alias
-    # in GROUP BY / ORDER BY (DuckDB resolves aliases there).
-    aliased = sql.replace(qcol, f"{period} AS {grain}", 1)
-    return aliased.replace(qcol, grain)
+    # Swap every raw column reference for a placeholder FIRST, so expanding it below
+    # can't rewrite the column name inside the period expression we insert (the
+    # period contains qcol). The first reference (SELECT) becomes the aliased period
+    # expression; the rest (GROUP BY / ORDER BY) reference the alias.
+    placeholder = "\x00bucket\x00"
+    tmp = sql.replace(qcol, placeholder)
+    tmp = tmp.replace(placeholder, f"{period} AS {grain}", 1)
+    return tmp.replace(placeholder, grain)
 
 
 # --- shared prompt ------------------------------------------------------------
